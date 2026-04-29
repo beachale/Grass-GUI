@@ -5985,9 +5985,9 @@ const GF = (() => {
     const hw = Math.max(1, Math.min(16, (navigator.hardwareConcurrency|0) || 1));
     const xCount = (x1 - x0 + 1);
 
-    // Old versions (b1.5-1.12) do far more work because Y affects offsets.
-    // Cap worker count to 4 to keep overhead low and match the newer-cracker style.
-    const targetWorkers = (version !== 'post1_12') ? 4 : hw;
+    // Y-dependent modes do more work per X/Z cell, so let them use more cores.
+    // Keep a small cap below the global hardware cap to avoid worker startup overhead on tiny scans.
+    const targetWorkers = (version !== 'post1_12') ? Math.min(hw, 8) : hw;
     const nWorkers = wantWorkers ? Math.max(1, Math.min(targetWorkers, hw, xCount)) : 1;
 
     if (wantWorkers && nWorkers > 1) {

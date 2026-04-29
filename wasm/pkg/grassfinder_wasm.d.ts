@@ -1,26 +1,60 @@
 /* tslint:disable */
 /* eslint-disable */
 
+export class ScanPlan {
+  free(): void;
+  [Symbol.dispose](): void;
+  scan_scored_box(x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number, tol: number, max_score: number): Int32Array;
+  scan_strict_box(x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number): Int32Array;
+  constructor(rel_dx: Int32Array, rel_dy: Int32Array, rel_dz: Int32Array, rel_packed: Uint16Array, rel_mask: Uint16Array, rel_drip: Uint8Array, seed_mode: number);
+}
+
 /**
- * Scored scan: returns Int32Array [x,y,z,score, x,y,z,score, ...]
+ * Legacy scored scan kept for existing callers.
  */
 export function scan_scored_box(rel_dx: Int32Array, rel_dy: Int32Array, rel_dz: Int32Array, rel_packed: Uint16Array, rel_mask: Uint16Array, rel_drip: Uint8Array, post1_12_any_y: boolean, x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number, tol: number, max_score: number): Int32Array;
 
 /**
- * Strict scan: returns Int32Array [x,y,z, x,y,z, ...]
+ * Scored scan with explicit seed mode.
+ *
+ * Returns Int32Array [x,y,z,score, x,y,z,score, ...].
+ */
+export function scan_scored_box_seed(rel_dx: Int32Array, rel_dy: Int32Array, rel_dz: Int32Array, rel_packed: Uint16Array, rel_mask: Uint16Array, rel_drip: Uint8Array, seed_mode: number, x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number, tol: number, max_score: number): Int32Array;
+
+/**
+ * Legacy strict scan kept for existing callers.
+ *
+ * post1_12_any_y=true maps to the 1.8+ Y-independent hash.
+ * false maps to the 1.7.10-style Y-dependent vanilla hash.
  */
 export function scan_strict_box(rel_dx: Int32Array, rel_dy: Int32Array, rel_dz: Int32Array, rel_packed: Uint16Array, rel_mask: Uint16Array, rel_drip: Uint8Array, post1_12_any_y: boolean, x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number): Int32Array;
+
+/**
+ * Strict scan with explicit seed mode.
+ *
+ * seed_mode:
+ * 0 = 1.8+ (Y ignored)
+ * 1 = 1.7.10 / vanilla XOR with Y
+ * 2 = b1.6-tb3 additive seed with Y
+ *
+ * Returns Int32Array [x,y,z, x,y,z, ...].
+ */
+export function scan_strict_box_seed(rel_dx: Int32Array, rel_dy: Int32Array, rel_dz: Int32Array, rel_packed: Uint16Array, rel_mask: Uint16Array, rel_drip: Uint8Array, seed_mode: number, x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, max_matches: number): Int32Array;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
-  readonly scan_scored_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number) => [number, number, number];
-  readonly scan_strict_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number) => [number, number, number];
-  readonly __wbindgen_externrefs: WebAssembly.Table;
-  readonly __wbindgen_malloc: (a: number, b: number) => number;
-  readonly __externref_table_dealloc: (a: number) => void;
-  readonly __wbindgen_start: () => void;
+  readonly __wbg_scanplan_free: (a: number, b: number) => void;
+  readonly scan_scored_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number) => void;
+  readonly scan_scored_box_seed: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number) => void;
+  readonly scan_strict_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => void;
+  readonly scan_strict_box_seed: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => void;
+  readonly scanplan_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
+  readonly scanplan_scan_scored_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
+  readonly scanplan_scan_strict_box: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+  readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+  readonly __wbindgen_export: (a: number, b: number) => number;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
