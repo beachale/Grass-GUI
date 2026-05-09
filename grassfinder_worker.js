@@ -43,9 +43,13 @@ self.onmessage = async (e) => {
   let done = 0;
   const matches = [];
 
-  // Chunk by Z so we can emit progress periodically (similar feel to the JS worker)
+  // Chunk by Z so we can emit progress periodically (similar feel to the JS worker).
+  // Strict Y-dependent scans use a WASM Y-prefilter, so their real hot-loop cost is
+  // closer to X/Z cells than X/Y/Z cells. Larger chunks avoid thousands of tiny
+  // worker/WASM calls on large pre-1.8 searches while keeping progress responsive.
   const emitEvery = mode === "scored" ? 500000 : 2000000;
-  const zChunk = Math.max(1, Math.floor(emitEvery / (xCount * yCount)));
+  const chunkYCost = (!anyY && mode !== "scored") ? 1 : yCount;
+  const zChunk = Math.max(1, Math.floor(emitEvery / (xCount * chunkYCost)));
 
   try {
     for (let zs = z0; zs <= z1; zs += zChunk) {

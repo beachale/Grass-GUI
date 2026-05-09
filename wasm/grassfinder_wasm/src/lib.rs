@@ -1,4 +1,5 @@
 use js_sys::Int32Array;
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
 const X_MULT: u32 = 3_129_871;
@@ -6,6 +7,16 @@ const Z_MULT_VANILLA: u32 = 116_129_781;
 const Z_MULT_TB3: u32 = 6_129_781;
 const LCG_MULT: u32 = 42_317_861;
 const LCG_ADDEND: u32 = 11;
+const MIX_INPUT_MASK: u32 = (1 << 28) - 1;
+const MIX_OUTPUT_MASK: u32 = 0x0fff;
+const MIX_LOW_BITS: u32 = 16;
+const MIX_HIGH_BITS: u32 = 12;
+const MIX_LOW_COUNT: u32 = 1 << MIX_LOW_BITS;
+const MIX_HIGH_MASK: u32 = (1 << MIX_HIGH_BITS) - 1;
+const PREFILTER_MAX_Y_COUNT: i32 = 64;
+const PREFILTER_FINGERPRINT_BITS: usize = 2048;
+const PREFILTER_FINGERPRINT_WORDS: usize = PREFILTER_FINGERPRINT_BITS / 64;
+const PREFILTER_FINGERPRINT_MASK: u32 = (PREFILTER_FINGERPRINT_BITS as u32) - 1;
 
 const SEED_POST_1_8: u8 = 0;
 const SEED_PRE_1_8: u8 = 1;
@@ -70,6 +81,31 @@ struct Sample {
     expected: u16,
     mask: u16,
     dripstone: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BaseYMask {
+    base: u32,
+    y_mask: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LowHighYMask {
+    high: u16,
+    y_mask: u64,
+}
+
+#[derive(Debug)]
+struct StrictYCache {
+    y0: i32,
+    y1: i32,
+    mode: SeedMode,
+    kind: u8,
+    pivot_index: usize,
+    pivot: Sample,
+    fingerprints: Vec<u64>,
+    low_offsets: Vec<u32>,
+    low_entries: Vec<LowHighYMask>,
 }
 
 impl Sample {
@@ -180,6 +216,47 @@ fn mix_low_12(seed_low: u32) -> u16 {
         .wrapping_mul(LCG_MULT)
         .wrapping_add(seed_low.wrapping_mul(LCG_ADDEND));
     ((mixed >> 16) & 0x0fff) as u16
+}
+
+#[inline(always)]
+fn inv_odd_mod_4096(a: u32) -> u32 {
+    debug_assert_eq!(a & 1, 1);
+    let mut x = 1u32;
+    for _ in 0..4 {
+        x = x.wrapping_mul(2u32.wrapping_sub(a.wrapping_mul(x))) & MIX_HIGH_MASK;
+    }
+    x
+}
+
+/// Invert `mix_low_12` for one exact 12-bit output.
+///
+/// For `s = low16 + (high12 << 16)`, bits 16..27 of
+/// `LCG_MULT*s*s + LCG_ADDEND*s` are linear in `high12` once `low16`
+/// is fixed:
+///
+/// `out = base(low16) + high12 * (LCG_ADDEND + 2*LCG_MULT*low16) (mod 4096)`.
+///
+/// The coefficient is always odd, so every low16 has exactly one high12.
+fn invert_exact_mix_low_12(target: u16) -> Vec<u32> {
+    let target = (target as u32) & MIX_OUTPUT_MASK;
+    let mut out = Vec::with_capacity(MIX_LOW_COUNT as usize);
+
+    for low in 0..MIX_LOW_COUNT {
+        let low64 = low as u64;
+        let base = (((low64 * low64 * (LCG_MULT as u64) + low64 * (LCG_ADDEND as u64))
+            >> MIX_LOW_BITS)
+            & (MIX_OUTPUT_MASK as u64)) as u32;
+        let coeff =
+            (LCG_ADDEND.wrapping_add(2u32.wrapping_mul(LCG_MULT & MIX_OUTPUT_MASK).wrapping_mul(low)))
+                & MIX_OUTPUT_MASK;
+        let high = target
+            .wrapping_sub(base)
+            .wrapping_mul(inv_odd_mod_4096(coeff))
+            & MIX_HIGH_MASK;
+        out.push(low | (high << MIX_LOW_BITS));
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -356,6 +433,140 @@ fn strict_check_kind(samples: &[Sample]) -> u8 {
     }
 }
 
+fn choose_strict_y_pivot(samples: &[Sample]) -> Option<usize> {
+    samples
+        .iter()
+        .position(|sample| !sample.dripstone && sample.mask == 0x0fff)
+}
+
+fn build_strict_y_cache(
+    mode: SeedMode,
+    kind: u8,
+    samples: &[Sample],
+    y0: i32,
+    y1: i32,
+) -> Option<StrictYCache> {
+    if !matches!(mode, SeedMode::Pre1_8) || y0 > y1 {
+        return None;
+    }
+
+    let y_count = y1.wrapping_sub(y0).wrapping_add(1);
+    if !(1..=PREFILTER_MAX_Y_COUNT).contains(&y_count) {
+        return None;
+    }
+
+    let pivot_index = choose_strict_y_pivot(samples)?;
+    let pivot = samples[pivot_index];
+    let residues = invert_exact_mix_low_12(pivot.expected);
+    let mut fingerprints = vec![0u64; (1usize << 16) * PREFILTER_FINGERPRINT_WORDS];
+    let mut entries =
+        Vec::with_capacity(residues.len().saturating_mul(y_count as usize).min(8_388_608));
+
+    for y_offset in 0..(y_count as u32) {
+        let y = y0.wrapping_add(y_offset as i32);
+        let y_part = y.wrapping_add(pivot.dy) as u32;
+        let y_bit = 1u64 << y_offset;
+
+        for &seed_low28 in &residues {
+            let base = match mode {
+                SeedMode::Pre1_8 => seed_low28 ^ (y_part & MIX_INPUT_MASK),
+                SeedMode::Beta16Tb3 => seed_low28.wrapping_sub(y_part) & MIX_INPUT_MASK,
+                SeedMode::Post1_8 => unreachable!(),
+            };
+
+            let low = (base & 0xffff) as usize;
+            let bucket = (base >> 16) & PREFILTER_FINGERPRINT_MASK;
+            fingerprints[low * PREFILTER_FINGERPRINT_WORDS + ((bucket >> 6) as usize)] |=
+                1u64 << (bucket & 63);
+            entries.push(BaseYMask {
+                base,
+                y_mask: y_bit,
+            });
+        }
+    }
+
+    entries.sort_unstable_by(|a, b| {
+        (a.base & 0xffff)
+            .cmp(&(b.base & 0xffff))
+            .then_with(|| (a.base >> 16).cmp(&(b.base >> 16)))
+            .then_with(|| a.y_mask.cmp(&b.y_mask))
+    });
+
+    let mut low_offsets = vec![0u32; (1usize << 16) + 1];
+    let mut low_entries: Vec<LowHighYMask> = Vec::with_capacity(entries.len());
+    let mut next_offset_low = 0usize;
+    let mut last_low: Option<usize> = None;
+
+    for entry in entries {
+        let low = (entry.base & 0xffff) as usize;
+        let high = ((entry.base >> 16) & MIX_HIGH_MASK) as u16;
+
+        while next_offset_low <= low {
+            low_offsets[next_offset_low] = low_entries.len() as u32;
+            next_offset_low += 1;
+        }
+
+        if last_low == Some(low) {
+            if let Some(last) = low_entries.last_mut() {
+                if last.high == high {
+                    last.y_mask |= entry.y_mask;
+                    continue;
+                }
+            }
+        }
+
+        low_entries.push(LowHighYMask {
+            high,
+            y_mask: entry.y_mask,
+        });
+        last_low = Some(low);
+    }
+
+    while next_offset_low < low_offsets.len() {
+        low_offsets[next_offset_low] = low_entries.len() as u32;
+        next_offset_low += 1;
+    }
+
+    Some(StrictYCache {
+        y0,
+        y1,
+        mode,
+        kind,
+        pivot_index,
+        pivot,
+        fingerprints,
+        low_offsets,
+        low_entries,
+    })
+}
+
+#[inline(always)]
+fn strict_y_cache_matches(cache: &StrictYCache, mode: SeedMode, kind: u8, y0: i32, y1: i32) -> bool {
+    cache.mode == mode && cache.kind == kind && cache.y0 == y0 && cache.y1 == y1
+}
+
+#[inline(always)]
+fn strict_y_cache_y_mask(cache: &StrictYCache, base: u32) -> u64 {
+    let low = (base & 0xffff) as usize;
+    let high = (base >> 16) as u16;
+    let bucket = (high as u32) & PREFILTER_FINGERPRINT_MASK;
+    let fingerprint_index = low * PREFILTER_FINGERPRINT_WORDS + ((bucket >> 6) as usize);
+
+    if (cache.fingerprints[fingerprint_index] & (1u64 << (bucket & 63))) == 0 {
+        return 0;
+    }
+
+    let start = cache.low_offsets[low] as usize;
+    let end = cache.low_offsets[low + 1] as usize;
+    for entry in &cache.low_entries[start..end] {
+        if entry.high == high {
+            return entry.y_mask;
+        }
+    }
+
+    0
+}
+
 #[inline(always)]
 fn candidate_strict_for_code<const MODE: u8, const KIND: u8>(
     samples: &[Sample],
@@ -379,6 +590,48 @@ fn candidate_strict_for_code<const MODE: u8, const KIND: u8>(
     }
 
     true
+}
+
+#[inline(always)]
+fn candidate_strict_for_code_skip<const MODE: u8, const KIND: u8>(
+    samples: &[Sample],
+    skip_index: usize,
+    x_seed: u32,
+    y: i32,
+    z_seed: u32,
+) -> bool {
+    for (index, &sample) in samples.iter().enumerate() {
+        if index == skip_index {
+            continue;
+        }
+
+        let pred = packed_from_parts_for_code::<MODE>(sample, x_seed, y, z_seed);
+        if KIND == STRICT_FULL_MASK {
+            if pred != sample.expected {
+                return false;
+            }
+        } else if KIND == STRICT_SIMPLE_MASK {
+            if (pred & sample.mask) != sample.expected {
+                return false;
+            }
+        } else if !strict_sample_matches(sample, pred) {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[inline(always)]
+fn pivot_base_for_code<const MODE: u8>(pivot: Sample, x_seed: u32, z_seed: u32) -> u32 {
+    let x_part = x_seed.wrapping_add(pivot.dx_seed);
+    let z_part = z_seed.wrapping_add(pivot.dz_seed);
+
+    if MODE == SEED_B1_6_TB3 {
+        x_part.wrapping_add(z_part) & MIX_INPUT_MASK
+    } else {
+        (x_part ^ z_part) & MIX_INPUT_MASK
+    }
 }
 
 #[inline(always)]
@@ -461,6 +714,171 @@ fn scan_strict_loop<const MODE: u8, const KIND: u8>(
     }
 
     Ok(Int32Array::from(out.as_slice()))
+}
+
+fn scan_strict_loop_y_prefilter<const MODE: u8, const KIND: u8>(
+    samples: &[Sample],
+    cache: &StrictYCache,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    z0: i32,
+    z1: i32,
+    max_matches: u32,
+) -> Result<Int32Array, JsValue> {
+    validate_bounds(x0, x1, y0, y1, z0, z1)?;
+    if max_matches == 0 {
+        return Ok(Int32Array::new_with_length(0));
+    }
+
+    debug_assert_eq!(cache.y0, y0);
+    debug_assert_eq!(cache.y1, y1);
+
+    let z_multiplier = z_multiplier_for_code::<MODE>();
+    let mut out: Vec<i32> = Vec::with_capacity((max_matches as usize).saturating_mul(3).min(4096));
+
+    let mut z = z0;
+    let mut z_seed = (z as u32).wrapping_mul(z_multiplier);
+    loop {
+        let mut x = x0;
+        let mut x_seed = (x as u32).wrapping_mul(X_MULT);
+        loop {
+            let base = pivot_base_for_code::<MODE>(cache.pivot, x_seed, z_seed);
+            let mut y_mask = strict_y_cache_y_mask(cache, base);
+            while y_mask != 0 {
+                let y_offset = y_mask.trailing_zeros() as i32;
+                y_mask &= y_mask - 1;
+                let y = y0.wrapping_add(y_offset);
+
+                if candidate_strict_for_code_skip::<MODE, KIND>(
+                    samples,
+                    cache.pivot_index,
+                    x_seed,
+                    y,
+                    z_seed,
+                ) {
+                    out.push(x);
+                    out.push(y);
+                    out.push(z);
+                    if (out.len() / 3) as u32 >= max_matches {
+                        return Ok(Int32Array::from(out.as_slice()));
+                    }
+                }
+            }
+
+            if x == x1 {
+                break;
+            }
+            x = x.wrapping_add(1);
+            x_seed = x_seed.wrapping_add(X_MULT);
+        }
+
+        if z == z1 {
+            break;
+        }
+        z = z.wrapping_add(1);
+        z_seed = z_seed.wrapping_add(z_multiplier);
+    }
+
+    Ok(Int32Array::from(out.as_slice()))
+}
+
+fn scan_strict_prepared_with_y_cache(
+    mode: SeedMode,
+    samples: &[Sample],
+    cache: &StrictYCache,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    z0: i32,
+    z1: i32,
+    max_matches: u32,
+) -> Result<Int32Array, JsValue> {
+    match mode {
+        SeedMode::Pre1_8 => match cache.kind {
+            STRICT_FULL_MASK => scan_strict_loop_y_prefilter::<SEED_PRE_1_8, STRICT_FULL_MASK>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+            STRICT_SIMPLE_MASK => scan_strict_loop_y_prefilter::<SEED_PRE_1_8, STRICT_SIMPLE_MASK>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+            _ => scan_strict_loop_y_prefilter::<SEED_PRE_1_8, STRICT_MIXED>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+        },
+        SeedMode::Beta16Tb3 => match cache.kind {
+            STRICT_FULL_MASK => scan_strict_loop_y_prefilter::<SEED_B1_6_TB3, STRICT_FULL_MASK>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+            STRICT_SIMPLE_MASK => scan_strict_loop_y_prefilter::<SEED_B1_6_TB3, STRICT_SIMPLE_MASK>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+            _ => scan_strict_loop_y_prefilter::<SEED_B1_6_TB3, STRICT_MIXED>(
+                samples,
+                cache,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+                max_matches,
+            ),
+        },
+        SeedMode::Post1_8 => scan_strict_prepared(
+            mode,
+            samples,
+            x0,
+            x1,
+            y0,
+            y1,
+            z0,
+            z1,
+            max_matches,
+        ),
+    }
 }
 
 fn scan_strict_prepared(
@@ -597,6 +1015,22 @@ fn scan_strict_impl(
     }
 
     let samples = make_samples(rel_dx, rel_dy, rel_dz, rel_packed, rel_mask, rel_drip, mode)?;
+    let kind = strict_check_kind(&samples);
+    if let Some(cache) = build_strict_y_cache(mode, kind, &samples, y0, y1) {
+        return scan_strict_prepared_with_y_cache(
+            mode,
+            &samples,
+            &cache,
+            x0,
+            x1,
+            y0,
+            y1,
+            z0,
+            z1,
+            max_matches,
+        );
+    }
+
     scan_strict_prepared(mode, &samples, x0, x1, y0, y1, z0, z1, max_matches)
 }
 
@@ -758,6 +1192,7 @@ fn scan_scored_impl(
 pub struct ScanPlan {
     mode: SeedMode,
     samples: Vec<Sample>,
+    strict_y_cache: RefCell<Option<StrictYCache>>,
 }
 
 #[wasm_bindgen]
@@ -775,7 +1210,11 @@ impl ScanPlan {
         let mode = SeedMode::from_code(seed_mode)?;
         let samples = make_samples(rel_dx, rel_dy, rel_dz, rel_packed, rel_mask, rel_drip, mode)?;
 
-        Ok(Self { mode, samples })
+        Ok(Self {
+            mode,
+            samples,
+            strict_y_cache: RefCell::new(None),
+        })
     }
 
     pub fn scan_strict_box(
@@ -788,6 +1227,34 @@ impl ScanPlan {
         z1: i32,
         max_matches: u32,
     ) -> Result<Int32Array, JsValue> {
+        let kind = strict_check_kind(&self.samples);
+        {
+            let mut cache_slot = self.strict_y_cache.borrow_mut();
+            let needs_rebuild = cache_slot
+                .as_ref()
+                .map(|cache| !strict_y_cache_matches(cache, self.mode, kind, y0, y1))
+                .unwrap_or(true);
+
+            if needs_rebuild {
+                *cache_slot = build_strict_y_cache(self.mode, kind, &self.samples, y0, y1);
+            }
+
+            if let Some(cache) = cache_slot.as_ref() {
+                return scan_strict_prepared_with_y_cache(
+                    self.mode,
+                    &self.samples,
+                    cache,
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    z0,
+                    z1,
+                    max_matches,
+                );
+            }
+        }
+
         scan_strict_prepared(
             self.mode,
             &self.samples,
@@ -1070,5 +1537,89 @@ mod tests {
                     .wrapping_add(64u32)
             )
         );
+    }
+
+    #[test]
+    fn exact_mix_inverse_reconstructs_all_low16_values() {
+        for target in [0x000, 0x123, 0x777, 0xfff] {
+            let residues = invert_exact_mix_low_12(target);
+            assert_eq!(residues.len(), 65_536);
+
+            for &seed_low28 in &residues {
+                assert_eq!(mix_low_12(seed_low28), target);
+                assert_eq!(seed_low28 & !MIX_INPUT_MASK, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn pre_1_8_y_prefilter_matches_bruteforce_candidates() {
+        let mode = SeedMode::Pre1_8;
+        let rel_dx = [0, -5];
+        let rel_dy = [0, 0];
+        let rel_dz = [0, -3];
+        let rel_packed = [
+            packed_direct(mode, 10, 64, -7),
+            packed_direct(mode, 5, 64, -10),
+        ];
+        let rel_mask = [0x0fffu16, 0x0fffu16];
+        let rel_drip = [0u8, 0u8];
+        let samples = make_samples(
+            &rel_dx,
+            &rel_dy,
+            &rel_dz,
+            &rel_packed,
+            &rel_mask,
+            &rel_drip,
+            mode,
+        )
+        .unwrap();
+        let kind = strict_check_kind(&samples);
+        let cache = build_strict_y_cache(mode, kind, &samples, 60, 70).unwrap();
+
+        let mut brute = Vec::new();
+        for y in 60..=70 {
+            for z in -15..=0 {
+                let z_seed = (z as u32).wrapping_mul(Z_MULT_VANILLA);
+                for x in 0..=20 {
+                    let x_seed = (x as u32).wrapping_mul(X_MULT);
+                    if candidate_strict_for_code::<SEED_PRE_1_8, STRICT_FULL_MASK>(
+                        &samples, x_seed, y, z_seed,
+                    ) {
+                        brute.push((x, y, z));
+                    }
+                }
+            }
+        }
+
+        let mut fast = Vec::new();
+        for z in -15..=0 {
+            let z_seed = (z as u32).wrapping_mul(Z_MULT_VANILLA);
+            for x in 0..=20 {
+                let x_seed = (x as u32).wrapping_mul(X_MULT);
+                let base = pivot_base_for_code::<SEED_PRE_1_8>(cache.pivot, x_seed, z_seed);
+                let mut y_mask = strict_y_cache_y_mask(&cache, base);
+                while y_mask != 0 {
+                    let y_offset = y_mask.trailing_zeros() as i32;
+                    y_mask &= y_mask - 1;
+                    let y = cache.y0 + y_offset;
+
+                    if candidate_strict_for_code_skip::<SEED_PRE_1_8, STRICT_FULL_MASK>(
+                        &samples,
+                        cache.pivot_index,
+                        x_seed,
+                        y,
+                        z_seed,
+                    ) {
+                        fast.push((x, y, z));
+                    }
+                }
+            }
+        }
+
+        brute.sort_unstable();
+        fast.sort_unstable();
+        assert!(brute.contains(&(10, 64, -7)));
+        assert_eq!(fast, brute);
     }
 }
